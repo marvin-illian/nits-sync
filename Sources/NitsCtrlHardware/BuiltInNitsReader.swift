@@ -1,4 +1,5 @@
 import Dispatch
+import CoreFoundation
 import Foundation
 import IOKit
 import CoreGraphics
@@ -7,24 +8,35 @@ import ObjectiveC.runtime
 
 /// Reads the luminance reported by the built-in Apple display.
 ///
-/// This type only reads I/O Registry properties. It never changes the built-in
-/// display's brightness, so macOS remains the source of truth when automatic
-/// brightness is enabled.
+/// This type only reads macOS display properties. It never changes the
+/// built-in display's brightness, so macOS remains the source of truth when
+/// automatic brightness is enabled.
 public final class BuiltInNitsReader: @unchecked Sendable {
     public typealias ChangeHandler = @Sendable (_ nits: Double) -> Void
 
-    /// Normal polling cadence (10 Hz), good for smooth operation with little
-    /// load while still following auto-brightness changes.
+    /// Normal fallback polling cadence (10 Hz). This is used only when the
+    /// private brightness-change notification interface is unavailable.
     public static let defaultPollingInterval: TimeInterval = 0.10
 
     /// Small changes below this value are not delivered to the callback.
     public static let defaultDeadbandNits = 0.5
 
-    /// Low-latency polling and filtering for the built-in source. This keeps
-    /// reaction time shorter while accepting a higher risk of jitter in noisy
-    /// setups.
+    /// Low-latency fallback polling and filtering for the built-in source.
     public static let lowLatencyPollingInterval: TimeInterval = 0.05
     public static let lowLatencyDeadbandNits: Double = 0.2
+    public static let lowLatencyNotificationSettleDelay: TimeInterval = 0.01
+
+    /// Normal mode gives CoreBrightness more time to publish physical nits.
+    public static let defaultNotificationSettleDelay: TimeInterval = 0.05
+
+    /// macOS can post the notification before its physical-nits property has
+    /// finished changing. One event-triggered follow-up avoids waiting for the
+    /// watchdog without turning normal operation back into frequent polling.
+    public static let notificationFollowUpDelay: TimeInterval = 0.12
+
+    /// Notifications are the primary source. This infrequent timer catches a
+    /// missed event after sleep or an internal macOS display-state transition.
+    public static let notificationWatchdogInterval: TimeInterval = 1.0
 
     private let pollingInterval: TimeInterval
     private let deadbandNits: Double
@@ -36,6 +48,9 @@ public final class BuiltInNitsReader: @unchecked Sendable {
     private let stateLock = NSLock()
     private var timer: DispatchSourceTimer?
     private var pollingGeneration: UInt64 = 0
+    private var notificationSequence: UInt64 = 0
+    private var registeredDisplayID: CGDirectDisplayID?
+    private var changeHandler: ChangeHandler?
     private var lastDeliveredNits: Double?
     private var pendingCallbackNits: Double?
     private var callbackScheduled = false
@@ -43,7 +58,7 @@ public final class BuiltInNitsReader: @unchecked Sendable {
     public init(
         pollingInterval: TimeInterval = BuiltInNitsReader.defaultPollingInterval,
         deadbandNits: Double = BuiltInNitsReader.defaultDeadbandNits,
-            callbackQueue: DispatchQueue = .main
+        callbackQueue: DispatchQueue = .main
     ) {
         self.pollingInterval = max(0.05, pollingInterval)
         self.deadbandNits = max(0, deadbandNits)
@@ -68,7 +83,7 @@ public final class BuiltInNitsReader: @unchecked Sendable {
     /// changes. Positive I/O Registry nits values are retained as fallbacks for
     /// OS revisions where that unheadered property is unavailable.
     public func currentNits() -> Double? {
-        // Keep the 10 Hz path cheap. A valid CoreBrightness value, including
+        // Keep the hot path cheap. A valid CoreBrightness value, including
         // zero, is authoritative and does not require walking the I/O Registry.
         Self.coreBrightnessPhysicalNits() ?? Self.readSnapshot().currentNits
     }
@@ -88,56 +103,82 @@ public final class BuiltInNitsReader: @unchecked Sendable {
         registryCapNits
     }
 
-    /// Starts sampling immediately and then every 100 ms by default.
+    /// Starts observing native brightness changes and samples immediately.
     ///
-    /// The first available value is delivered. Later values are delivered only
-    /// after moving by at least `deadbandNits` from the last delivered value.
-    /// The callback is dispatched on the queue supplied at initialization
-    /// (the main queue by default). Calling this again replaces the old poller.
+    /// When macOS's private notification interface is available, a one-second
+    /// watchdog is the only recurring work. If registration is unavailable,
+    /// this falls back to the configured polling cadence. The first available
+    /// value is delivered; later values must cross `deadbandNits`. Calling this
+    /// again replaces the previous observation.
     public func startPolling(onChange handler: @escaping ChangeHandler) {
+        stopPolling()
         let source = DispatchSource.makeTimerSource(queue: pollingQueue)
 
         stateLock.lock()
         pollingGeneration &+= 1
         let generation = pollingGeneration
-        let previousTimer = timer
         timer = source
+        changeHandler = handler
+        registeredDisplayID = nil
         lastDeliveredNits = nil
         pendingCallbackNits = nil
         callbackScheduled = false
         stateLock.unlock()
 
-        previousTimer?.cancel()
+        let observedDisplayID = registerForBrightnessChanges()
+        stateLock.lock()
+        let observationIsCurrent = generation == pollingGeneration && timer != nil
+        if observationIsCurrent {
+            registeredDisplayID = observedDisplayID
+        }
+        stateLock.unlock()
+
+        if !observationIsCurrent, let observedDisplayID {
+            unregisterForBrightnessChanges(displayID: observedDisplayID)
+        }
 
         source.setEventHandler { [weak self] in
-            self?.poll(generation: generation, handler: handler)
+            self?.poll(generation: generation)
         }
+        let repeatingInterval = observedDisplayID == nil
+            ? pollingInterval
+            : Self.notificationWatchdogInterval
+        let timerLeeway: DispatchTimeInterval = observedDisplayID == nil
+            ? .milliseconds(25)
+            : .milliseconds(250)
         source.schedule(
             deadline: .now(),
-            repeating: pollingInterval,
-            leeway: .milliseconds(25)
+            repeating: repeatingInterval,
+            leeway: timerLeeway
         )
         // A source must be activated even if stopPolling() raced with setup and
         // cancelled it while it was suspended.
         source.activate()
     }
 
-    /// Stops polling. Any callback already queued but not yet delivered is
+    /// Stops observing. Any callback already queued but not yet delivered is
     /// suppressed by the generation check.
     public func stopPolling() {
         stateLock.lock()
         pollingGeneration &+= 1
+        notificationSequence &+= 1
         let previousTimer = timer
+        let previousDisplayID = registeredDisplayID
         timer = nil
+        registeredDisplayID = nil
+        changeHandler = nil
         lastDeliveredNits = nil
         pendingCallbackNits = nil
         callbackScheduled = false
         stateLock.unlock()
 
         previousTimer?.cancel()
+        if let previousDisplayID {
+            unregisterForBrightnessChanges(displayID: previousDisplayID)
+        }
     }
 
-    private func poll(generation: UInt64, handler: @escaping ChangeHandler) {
+    private func poll(generation: UInt64) {
         guard let nits = currentNits() else { return }
 
         stateLock.lock()
@@ -159,31 +200,199 @@ public final class BuiltInNitsReader: @unchecked Sendable {
         guard shouldScheduleCallback else { return }
 
         callbackQueue.async { [weak self] in
-            self?.deliverPending(generation: generation, handler: handler)
+            self?.deliverPending(generation: generation)
         }
     }
 
-    private func deliverPending(
-        generation: UInt64,
-        handler: @escaping ChangeHandler
-    ) {
+    private func deliverPending(generation: UInt64) {
         stateLock.lock()
         guard generation == pollingGeneration, timer != nil else {
             stateLock.unlock()
             return
         }
         let nits = pendingCallbackNits
+        let handler = changeHandler
         pendingCallbackNits = nil
         callbackScheduled = false
         stateLock.unlock()
 
-        if let nits {
+        if let nits, let handler {
             handler(nits)
         }
     }
 }
 
 private extension BuiltInNitsReader {
+    typealias RegisterBrightnessNotificationsFunction = @convention(c) (
+        CGDirectDisplayID,
+        CGDirectDisplayID,
+        CFNotificationCallback
+    ) -> Int32
+
+    typealias UnregisterBrightnessNotificationsFunction = @convention(c) (
+        CGDirectDisplayID,
+        CGDirectDisplayID
+    ) -> Int32
+
+    final class WeakReaderBox {
+        weak var reader: BuiltInNitsReader?
+
+        init(_ reader: BuiltInNitsReader) {
+            self.reader = reader
+        }
+    }
+
+    static let notificationLock = NSLock()
+    static var notificationReaders: [CGDirectDisplayID: WeakReaderBox] = [:]
+
+    static let brightnessNotificationCallback: CFNotificationCallback = {
+        _, observer, _, _, _ in
+        guard let observer else { return }
+        let rawDisplayID = UInt(bitPattern: observer)
+        guard rawDisplayID <= UInt(UInt32.max) else { return }
+        let displayID = CGDirectDisplayID(rawDisplayID)
+
+        notificationLock.lock()
+        let reader = notificationReaders[displayID]?.reader
+        if reader == nil {
+            notificationReaders.removeValue(forKey: displayID)
+        }
+        notificationLock.unlock()
+
+        reader?.brightnessNotificationReceived(displayID: displayID)
+    }
+
+    func brightnessNotificationReceived(displayID: CGDirectDisplayID) {
+        stateLock.lock()
+        guard registeredDisplayID == displayID, timer != nil else {
+            stateLock.unlock()
+            return
+        }
+        let generation = pollingGeneration
+        notificationSequence &+= 1
+        let sequence = notificationSequence
+        stateLock.unlock()
+
+        // DisplayServices can publish before CoreBrightness's physical-nits
+        // property has settled. Debounce rapid steps and read the latest value
+        // after a short delay instead of replaying stale intermediate values.
+        let settleDelay = pollingInterval <= Self.lowLatencyPollingInterval
+            ? Self.lowLatencyNotificationSettleDelay
+            : Self.defaultNotificationSettleDelay
+        pollingQueue.asyncAfter(deadline: .now() + settleDelay) { [weak self] in
+            self?.pollAfterBrightnessNotification(
+                generation: generation,
+                sequence: sequence
+            )
+        }
+        pollingQueue.asyncAfter(
+            deadline: .now() + Self.notificationFollowUpDelay
+        ) { [weak self] in
+            self?.pollAfterBrightnessNotification(
+                generation: generation,
+                sequence: sequence
+            )
+        }
+    }
+
+    func pollAfterBrightnessNotification(
+        generation: UInt64,
+        sequence: UInt64
+    ) {
+        stateLock.lock()
+        let isLatest = generation == pollingGeneration &&
+            sequence == notificationSequence &&
+            timer != nil
+        stateLock.unlock()
+        guard isLatest else { return }
+        poll(generation: generation)
+    }
+
+    func registerForBrightnessChanges() -> CGDirectDisplayID? {
+        guard let register = Self.registerBrightnessNotifications,
+              Self.unregisterBrightnessNotifications != nil,
+              let displayID = Self.activeBuiltInDisplayID() else {
+            return nil
+        }
+
+        Self.notificationLock.lock()
+        Self.notificationReaders[displayID] = WeakReaderBox(self)
+        Self.notificationLock.unlock()
+
+        let result = Self.performOnMain {
+            register(
+                displayID,
+                displayID,
+                Self.brightnessNotificationCallback
+            )
+        }
+        guard result == KERN_SUCCESS else {
+            Self.removeNotificationReader(self, displayID: displayID)
+            return nil
+        }
+        return displayID
+    }
+
+    func unregisterForBrightnessChanges(displayID: CGDirectDisplayID) {
+        Self.removeNotificationReader(self, displayID: displayID)
+        Self.performOnMain {
+            _ = Self.unregisterBrightnessNotifications?(displayID, displayID)
+        }
+    }
+
+    static func performOnMain<T>(_ body: () -> T) -> T {
+        if Thread.isMainThread {
+            return body()
+        }
+        return DispatchQueue.main.sync(execute: body)
+    }
+
+    static func removeNotificationReader(
+        _ reader: BuiltInNitsReader,
+        displayID: CGDirectDisplayID
+    ) {
+        notificationLock.lock()
+        if notificationReaders[displayID]?.reader === reader {
+            notificationReaders.removeValue(forKey: displayID)
+        }
+        notificationLock.unlock()
+    }
+
+    static let displayServicesHandle: UnsafeMutableRawPointer? = {
+        dlopen(
+            "/System/Library/PrivateFrameworks/DisplayServices.framework/Versions/A/DisplayServices",
+            RTLD_LAZY | RTLD_LOCAL
+        )
+    }()
+
+    static let registerBrightnessNotifications: RegisterBrightnessNotificationsFunction? = {
+        guard let displayServicesHandle,
+              let symbol = dlsym(
+                  displayServicesHandle,
+                  "DisplayServicesRegisterForBrightnessChangeNotifications"
+              ) else {
+            return nil
+        }
+        return unsafeBitCast(
+            symbol,
+            to: RegisterBrightnessNotificationsFunction.self
+        )
+    }()
+
+    static let unregisterBrightnessNotifications: UnregisterBrightnessNotificationsFunction? = {
+        guard let displayServicesHandle,
+              let symbol = dlsym(
+                  displayServicesHandle,
+                  "DisplayServicesUnregisterForBrightnessChangeNotifications"
+              ) else {
+            return nil
+        }
+        return unsafeBitCast(
+            symbol,
+            to: UnregisterBrightnessNotificationsFunction.self
+        )
+    }()
+
     struct RegistrySnapshot {
         var framebufferNits: Double?
         var backlightNits: Double?

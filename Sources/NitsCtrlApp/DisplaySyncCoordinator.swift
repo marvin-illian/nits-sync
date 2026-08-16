@@ -87,6 +87,10 @@ enum CoordinatorError: LocalizedError {
 final class DisplaySyncCoordinator: @unchecked Sendable {
     typealias StateHandler = @Sendable (SyncAppSnapshot) -> Void
     private static let maximumAutomaticWriteAttempts = 2
+    /// Live writes are intentionally not read back one-by-one. Waiting for a
+    /// short quiet period lets slow DDC firmware finish the newest command and
+    /// prevents rapid key presses from queueing stale verification work.
+    private static let liveVerificationQuietPeriod: TimeInterval = 0.30
 
     private struct CalibrationSession {
         let displayID: String
@@ -124,6 +128,10 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
     private var displayRetryDelay: TimeInterval = 2
     private var isRetryingDisplays = false
     private var writeRetryStates: [String: (rawValue: UInt16, attempts: Int)] = [:]
+    private var liveVerificationWorkItems: [String: DispatchWorkItem] = [:]
+    private var liveVerificationTokens: [String: UInt64] = [:]
+    private var liveVerificationSequence: UInt64 = 0
+    private var lastLiveWriteUptime: [String: TimeInterval] = [:]
     private let logger = Logger(subsystem: "com.local.nits-sync", category: "coordinator")
 
     private var isSystemPaused: Bool {
@@ -733,6 +741,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         generation &+= 1
         nitsReader.stopPolling()
         cancelDisplayRetryUnlocked()
+        cancelAllLiveVerificationsUnlocked()
     }
 
     private func resumeFollowingIfAppropriateUnlocked() {
@@ -754,6 +763,13 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             estimatedNits = estimatedNits.filter { displays[$0.key] != nil }
             clamps = clamps.filter { displays[$0.key] != nil }
             writeRetryStates = writeRetryStates.filter { displays[$0.key] != nil }
+            lastLiveWriteUptime = lastLiveWriteUptime.filter { displays[$0.key] != nil }
+            let disconnectedVerificationIDs = liveVerificationWorkItems.keys.filter {
+                displays[$0] == nil
+            }
+            for displayID in disconnectedVerificationIDs {
+                cancelLiveVerificationUnlocked(displayID: displayID)
+            }
 
             var needsRetry = found.isEmpty || (calibration.map {
                 displays[$0.displayID] == nil
@@ -900,9 +916,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                     rawValues[key] = current
                     blockedDisplays.remove(key)
                     displayErrors[key] = nil
-                } else if [entry.lastWrittenRawValue, entry.pendingRawValue]
-                    .compactMap({ $0 })
-                    .contains(current.current) {
+                } else if entry.knownAppWrittenRawValues.contains(current.current) {
                     try ddc.writeBrightness(
                         display,
                         value: entry.originalRawValue,
@@ -958,36 +972,47 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             if rawValues[display.id]?.current == target.rawValue {
                 writeRetryStates[display.id] = nil
                 displayErrors[display.id] = nil
+                if sessionEntries[display.id]?.pendingRawValue == target.rawValue,
+                   liveVerificationWorkItems[display.id] == nil {
+                    scheduleLiveVerificationUnlocked(
+                        displayID: display.id,
+                        targetRawValue: target.rawValue,
+                        didReapply: false
+                    )
+                }
                 continue
             }
             do {
                 let baseline = try captureBaselineIfNeededUnlocked(for: display)
                 do {
-                    // Record intent before touching hardware. On recovery, the
-                    // current value can safely match either the last confirmed
-                    // value or this pending value.
+                    // Record intent before touching hardware. Recovery retains
+                    // the bounded set of recent values that may have reached
+                    // slow monitor firmware during this unverified burst.
                     var intended = baseline
                     intended.recordWriteIntent(target.rawValue)
                     _ = try journalStore.upsert(intended)
                     sessionEntries[display.id] = intended
 
+                    cancelLiveVerificationUnlocked(displayID: display.id)
                     try ddc.writeBrightness(
                         display,
                         value: target.rawValue,
                         knownMaximum: baseline.originalMaximumRawValue,
-                        verify: true
+                        verify: false
                     )
                     rawValues[display.id] = (
                         current: target.rawValue,
                         maximum: baseline.originalMaximumRawValue
                     )
-                    var updated = intended
-                    updated.confirmWrite(target.rawValue)
-                    _ = try journalStore.upsert(updated)
-                    sessionEntries[display.id] = updated
+                    lastLiveWriteUptime[display.id] = ProcessInfo.processInfo.systemUptime
                     writeRetryStates[display.id] = nil
                     displayErrors[display.id] = nil
-                    logger.debug("Applied sync target to \(display.name, privacy: .public): \(target.rawValue)/\(baseline.originalMaximumRawValue)")
+                    scheduleLiveVerificationUnlocked(
+                        displayID: display.id,
+                        targetRawValue: target.rawValue,
+                        didReapply: false
+                    )
+                    logger.debug("Sent live sync target to \(display.name, privacy: .public): \(target.rawValue, privacy: .public)/\(baseline.originalMaximumRawValue, privacy: .public)")
                 } catch let syncError {
                     // Keep the baseline entry and retry this write instead of
                     // immediately restoring while a transient write failure is
@@ -996,7 +1021,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                     pending.recordWriteIntent(target.rawValue)
                     _ = try? journalStore.upsert(pending)
                     sessionEntries[display.id] = pending
-                    logger.notice("Sync write failed, scheduling retry for \(display.name, privacy: .public): \(syncError.localizedDescription)")
+                    logger.notice("Live sync SET failed for \(display.name, privacy: .public), target \(target.rawValue, privacy: .public): \(syncError.localizedDescription, privacy: .public)")
                     recordRetryableWriteFailureUnlocked(
                         syncError,
                         displayID: display.id,
@@ -1012,6 +1037,129 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             }
         }
         updateActivityUnlocked()
+    }
+
+    /// Verifies only the newest live target after DDC traffic has gone quiet.
+    /// Calibration and restoration continue to use synchronous verification.
+    private func scheduleLiveVerificationUnlocked(
+        displayID: String,
+        targetRawValue: UInt16,
+        didReapply: Bool
+    ) {
+        cancelLiveVerificationUnlocked(displayID: displayID)
+        liveVerificationSequence &+= 1
+        let token = liveVerificationSequence
+        liveVerificationTokens[displayID] = token
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.liveVerificationTokens[displayID] == token else { return }
+            self.liveVerificationWorkItems[displayID] = nil
+            self.liveVerificationTokens[displayID] = nil
+            self.verifyLatestLiveWriteUnlocked(
+                displayID: displayID,
+                targetRawValue: targetRawValue,
+                didReapply: didReapply
+            )
+            self.updateActivityUnlocked()
+            self.publishUnlocked()
+        }
+        liveVerificationWorkItems[displayID] = workItem
+        queue.asyncAfter(
+            deadline: .now() + Self.liveVerificationQuietPeriod,
+            execute: workItem
+        )
+    }
+
+    private func verifyLatestLiveWriteUnlocked(
+        displayID: String,
+        targetRawValue: UInt16,
+        didReapply: Bool
+    ) {
+        guard phase == .syncing,
+              let display = displays[displayID],
+              let pending = sessionEntries[displayID],
+              pending.pendingRawValue == targetRawValue else { return }
+
+        let readback: (current: UInt16, maximum: UInt16)
+        do {
+            readback = try ddc.readBrightness(display)
+            rawValues[displayID] = readback
+        } catch {
+            displayErrors[displayID] = "Could not verify the latest brightness yet. The next change will try again."
+            logger.notice("Deferred brightness read failed for \(display.name, privacy: .public), target \(targetRawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return
+        }
+
+        if readback.current == targetRawValue {
+            var confirmed = pending
+            confirmed.confirmWrite(targetRawValue)
+            do {
+                _ = try journalStore.upsert(confirmed)
+                sessionEntries[displayID] = confirmed
+                writeRetryStates[displayID] = nil
+                displayErrors[displayID] = nil
+                logger.debug("Confirmed newest live target for \(display.name, privacy: .public): \(targetRawValue, privacy: .public)/\(readback.maximum, privacy: .public)")
+            } catch {
+                displayErrors[displayID] = "Brightness changed, but its recovery record could not be updated: \(error.localizedDescription)"
+                logger.error("Could not confirm the recovery journal for \(display.name, privacy: .public), target \(targetRawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+            return
+        }
+
+        guard !didReapply else {
+            displayErrors[displayID] = "The monitor reported brightness \(readback.current) after target \(targetRawValue). The next change will try again."
+            logger.notice("Deferred brightness verification mismatch for \(display.name, privacy: .public): target \(targetRawValue, privacy: .public), received \(readback.current, privacy: .public)")
+            return
+        }
+
+        do {
+            try ddc.writeBrightness(
+                display,
+                value: targetRawValue,
+                knownMaximum: readback.maximum,
+                verify: false
+            )
+            rawValues[displayID] = (
+                current: targetRawValue,
+                maximum: readback.maximum
+            )
+            lastLiveWriteUptime[displayID] = ProcessInfo.processInfo.systemUptime
+            displayErrors[displayID] = nil
+            logger.notice("Reapplied newest live target for \(display.name, privacy: .public) after delayed readback: target \(targetRawValue, privacy: .public), received \(readback.current, privacy: .public)")
+            scheduleLiveVerificationUnlocked(
+                displayID: displayID,
+                targetRawValue: targetRawValue,
+                didReapply: true
+            )
+        } catch {
+            displayErrors[displayID] = "The monitor did not accept the latest brightness. The next change will try again."
+            logger.notice("Live target reapply failed for \(display.name, privacy: .public), target \(targetRawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func cancelLiveVerificationUnlocked(displayID: String) {
+        liveVerificationWorkItems.removeValue(forKey: displayID)?.cancel()
+        liveVerificationTokens[displayID] = nil
+    }
+
+    private func cancelAllLiveVerificationsUnlocked() {
+        for workItem in liveVerificationWorkItems.values {
+            workItem.cancel()
+        }
+        liveVerificationWorkItems.removeAll()
+        liveVerificationTokens.removeAll()
+    }
+
+    /// A final restore must not race firmware that is still applying the last
+    /// fast live SET. Sleeping releases the CPU; this is not busy waiting.
+    private func waitForLiveWriteToSettleUnlocked(displayID: String) {
+        guard let writeUptime = lastLiveWriteUptime[displayID] else { return }
+        let elapsed = ProcessInfo.processInfo.systemUptime - writeUptime
+        let remaining = Self.liveVerificationQuietPeriod - elapsed
+        if remaining > 0 {
+            Thread.sleep(forTimeInterval: remaining)
+        }
     }
 
     private func recordRetryableWriteFailureUnlocked(
@@ -1068,6 +1216,8 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         var failures: [String] = []
         for entry in candidates {
             let key = entry.identity.stableKey
+            cancelLiveVerificationUnlocked(displayID: key)
+            waitForLiveWriteToSettleUnlocked(displayID: key)
             guard let display = displays[key] else {
                 blockedDisplays.insert(key)
                 displayErrors[key] = "Original brightness restore is pending until this monitor reconnects."
@@ -1089,6 +1239,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 clamps[key] = SyncClamp.none
                 blockedDisplays.remove(key)
                 displayErrors[key] = nil
+                lastLiveWriteUptime[key] = nil
             } catch {
                 blockedDisplays.insert(key)
                 displayErrors[key] = "Restore failed: \(error.localizedDescription)"

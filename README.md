@@ -51,14 +51,53 @@ the MacBook is already brighter than an external monitor's detected ceiling,
 that monitor correctly remains at its maximum until the MacBook drops back
 into the monitor's range.
 
+### CPU and event handling
+
+Nits Sync listens for the built-in display's native macOS brightness-change
+notifications and reads physical nits only when a change occurs. A one-second
+watchdog catches notifications missed during sleep or a display transition.
+If that private notification interface is unavailable on a macOS version, the
+app falls back to timer sampling. Each notification gets a fast read and one
+event-triggered follow-up at 120 ms in case macOS published physical nits late.
+Rapid notifications are coalesced so the external monitor receives the newest
+value instead of replaying stale steps. Neither mode uses busy waiting.
+
+Live synchronization sends the newest DDC brightness value immediately and
+does not block every key press on a slow monitor readback. After 300 ms without
+a newer target, Nits Sync reads the monitor once and confirms only that newest
+value. If the monitor still reports an older value, the app reapplies the
+newest target once and checks again. This quiet period delays only the safety
+check, not the visible brightness command. Calibration, Reset, and Quit remain
+strictly verified; a restore also allows an in-flight live command to settle
+before writing the saved original value.
+
+### Diagnostics and log size
+
+Nits Sync writes only sparse diagnostics to macOS Unified Logging. It does not
+create or append to its own log file. macOS manages, rotates, compresses, and
+eventually purges Unified Logging data under the system's storage limits, so
+the app cannot accumulate an unlimited log file. Successful live confirmations
+use debug-level messages; persistent messages are reserved for unusual DDC
+failures and mismatches.
+
+To inspect recent DDC anomalies:
+
+```sh
+log show --last 10m --style compact \
+  --predicate 'subsystem == "com.local.nits-sync"'
+```
+
 ### Low-latency mode
 
 In the menu, enable **Low-Latency Sync** to reduce reaction time for external
 brightness updates. This is done by:
 
-- faster built-in nits sampling,
 - a smaller deadband, and
-- shorter DDC write/read verification delay.
+- fewer and shorter transport retries after a DDC error.
+
+Brightness notifications remain immediate in either mode. If Nits Sync must
+fall back to timer sampling, low-latency mode uses 20 samples per second
+instead of the standard 10.
 
 Tradeoff: it can produce more jitter on noisy monitors or occasionally show
 temporary mismatches after transient DDC errors.

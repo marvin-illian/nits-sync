@@ -27,6 +27,32 @@ final class RestoreJournalTests: XCTestCase {
         XCTAssertEqual(entry.pendingRawValue, 70)
     }
 
+    func testRapidUnverifiedWritesRemainRecognizableUntilNewestConfirmation() {
+        var entry = RestoreJournalEntry(
+            identity: ExternalDisplayIdentity(
+                vendorID: 1,
+                productID: 2,
+                serialNumber: 3
+            ),
+            originalRawValue: 100,
+            originalMaximumRawValue: 100,
+            sessionID: UUID()
+        )
+
+        entry.recordWriteIntent(8)
+        entry.recordWriteIntent(12)
+        entry.recordWriteIntent(20)
+
+        XCTAssertEqual(entry.pendingRawValue, 20)
+        XCTAssertEqual(entry.knownAppWrittenRawValues, Set([8, 12, 20]))
+
+        entry.confirmWrite(20)
+
+        XCTAssertNil(entry.pendingRawValue)
+        XCTAssertNil(entry.unverifiedRawValues)
+        XCTAssertEqual(entry.knownAppWrittenRawValues, Set([20]))
+    }
+
     func testMissingJournalLoadsAsEmpty() throws {
         try withTemporaryStore { store, _ in
             let journal = try store.load()

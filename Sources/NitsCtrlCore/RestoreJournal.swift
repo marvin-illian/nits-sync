@@ -16,6 +16,8 @@ public enum RestoreEntryState: String, Codable, Hashable, Sendable {
 }
 
 public struct RestoreJournalEntry: Codable, Hashable, Sendable, Identifiable {
+    private static let maximumTrackedUnverifiedValues = 64
+
     public var identity: ExternalDisplayIdentity
     public var originalRawValue: UInt16
     public var originalMaximumRawValue: UInt16
@@ -23,6 +25,11 @@ public struct RestoreJournalEntry: Codable, Hashable, Sendable, Identifiable {
     public var lastWrittenRawValue: UInt16?
     /// Value durably recorded before a hardware write begins.
     public var pendingRawValue: UInt16?
+    /// Recent values that may have reached the monitor but whose readback was
+    /// deferred. This is bounded and cleared as soon as the newest value is
+    /// confirmed, so rapid live updates remain recoverable without allowing
+    /// the journal to grow indefinitely.
+    public var unverifiedRawValues: [UInt16]?
     public var sessionID: UUID
     public var state: RestoreEntryState
     public var capturedAt: Date
@@ -33,6 +40,7 @@ public struct RestoreJournalEntry: Codable, Hashable, Sendable, Identifiable {
         originalMaximumRawValue: UInt16,
         lastWrittenRawValue: UInt16? = nil,
         pendingRawValue: UInt16? = nil,
+        unverifiedRawValues: [UInt16]? = nil,
         sessionID: UUID,
         state: RestoreEntryState = .captured,
         capturedAt: Date = Date()
@@ -42,6 +50,7 @@ public struct RestoreJournalEntry: Codable, Hashable, Sendable, Identifiable {
         self.originalMaximumRawValue = originalMaximumRawValue
         self.lastWrittenRawValue = lastWrittenRawValue
         self.pendingRawValue = pendingRawValue
+        self.unverifiedRawValues = unverifiedRawValues
         self.sessionID = sessionID
         self.state = state
         self.capturedAt = capturedAt
@@ -52,6 +61,17 @@ public struct RestoreJournalEntry: Codable, Hashable, Sendable, Identifiable {
     }
 
     public mutating func recordWriteIntent(_ rawValue: UInt16) {
+        var candidates = unverifiedRawValues ?? []
+        if let pendingRawValue, !candidates.contains(pendingRawValue) {
+            candidates.append(pendingRawValue)
+        }
+        if !candidates.contains(rawValue) {
+            candidates.append(rawValue)
+        }
+        if candidates.count > Self.maximumTrackedUnverifiedValues {
+            candidates.removeFirst(candidates.count - Self.maximumTrackedUnverifiedValues)
+        }
+        unverifiedRawValues = candidates
         pendingRawValue = rawValue
         state = .modified
     }
@@ -59,7 +79,21 @@ public struct RestoreJournalEntry: Codable, Hashable, Sendable, Identifiable {
     public mutating func confirmWrite(_ rawValue: UInt16) {
         lastWrittenRawValue = rawValue
         pendingRawValue = nil
+        unverifiedRawValues = nil
         state = .modified
+    }
+
+    /// Values that recovery may safely recognize as app-owned. The original
+    /// value is handled separately by the recovery policy.
+    public var knownAppWrittenRawValues: Set<UInt16> {
+        var values = Set(unverifiedRawValues ?? [])
+        if let lastWrittenRawValue {
+            values.insert(lastWrittenRawValue)
+        }
+        if let pendingRawValue {
+            values.insert(pendingRawValue)
+        }
+        return values
     }
 
     /// Compatibility convenience for callers that already completed a write.
