@@ -114,6 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         let pauseNotifications: [(Notification.Name, SystemPauseReason)] = [
             (NSWorkspace.willSleepNotification, .sleep),
+            (NSWorkspace.screensDidSleepNotification, .displaySleep),
             (NSWorkspace.sessionDidResignActiveNotification, .inactiveSession),
         ]
         for (name, reason) in pauseNotifications {
@@ -127,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let resumeNotifications: [(Notification.Name, SystemPauseReason)] = [
             (NSWorkspace.didWakeNotification, .sleep),
+            (NSWorkspace.screensDidWakeNotification, .displaySleep),
             (NSWorkspace.sessionDidBecomeActiveNotification, .inactiveSession),
         ]
         for (name, reason) in resumeNotifications {

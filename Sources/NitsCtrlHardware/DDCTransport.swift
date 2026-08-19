@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 @preconcurrency import CNitsCtrlDDC
 import NitsCtrlCore
+import OSLog
 
 /// A discovered external monitor and its opaque DDC service handle.
 public final class DDCDisplay: @unchecked Sendable, Identifiable {
@@ -118,6 +119,7 @@ public enum DDCTransportError: LocalizedError, Sendable {
 /// converts them through the monitor's stored calibration curve.
 public final class DDCTransport: @unchecked Sendable {
     public static let brightnessVCPCode: UInt8 = 0x10
+    private static let slowOperationThreshold: TimeInterval = 1
     public enum LatencyMode: Sendable {
         case standard
         case lowLatency
@@ -128,6 +130,7 @@ public final class DDCTransport: @unchecked Sendable {
     private let retryDelay: TimeInterval
     private let verificationDelay: TimeInterval
     private let verificationReadAttempts: Int
+    private let logger = Logger(subsystem: "com.local.nits-sync", category: "ddc")
 
     public init(
         maximumAttempts: Int = 3,
@@ -208,6 +211,7 @@ public final class DDCTransport: @unchecked Sendable {
             var lastReadback: UInt16?
 
             for attempt in 1...maximumAttempts {
+                let attemptStarted = ProcessInfo.processInfo.systemUptime
                 var bridgeError: NSError?
                 let wrote = CNDDCWriteVCP(
                     display.service,
@@ -217,7 +221,15 @@ public final class DDCTransport: @unchecked Sendable {
                 )
 
                 if wrote {
-                    guard verify else { return }
+                    guard verify else {
+                        logSlowOperationIfNeeded(
+                            "DDC write",
+                            display: display,
+                            attempt: attempt,
+                            started: attemptStarted
+                        )
+                        return
+                    }
                     if verificationDelay > 0 {
                         Thread.sleep(forTimeInterval: verificationDelay)
                     }
@@ -242,6 +254,12 @@ public final class DDCTransport: @unchecked Sendable {
                             )
                         }
                         if readback.current == value {
+                            logSlowOperationIfNeeded(
+                                "Verified DDC write",
+                                display: display,
+                                attempt: attempt,
+                                started: attemptStarted
+                            )
                             return
                         }
                         lastReason = "Readback was \(readback.current)."
@@ -250,6 +268,9 @@ public final class DDCTransport: @unchecked Sendable {
                     lastReason = bridgeError?.localizedDescription ??
                         "The monitor did not accept the DDC write."
                 }
+
+                let attemptDuration = ProcessInfo.processInfo.systemUptime - attemptStarted
+                logger.notice("DDC write attempt \(attempt, privacy: .public) for \(display.name, privacy: .public) failed after \(attemptDuration, format: .fixed(precision: 2)) seconds: \(lastReason, privacy: .public)")
 
                 if attempt < maximumAttempts, retryDelay > 0 {
                     Thread.sleep(forTimeInterval: retryDelay)
@@ -279,6 +300,7 @@ public final class DDCTransport: @unchecked Sendable {
         var lastInvalidReply: (current: UInt16, maximum: UInt16)?
 
         for attempt in 1...max(1, attempts) {
+            let attemptStarted = ProcessInfo.processInfo.systemUptime
             var value = CNDDCVCPValue(current: 0, maximum: 0)
             var bridgeError: NSError?
             if CNDDCReadVCP(
@@ -288,6 +310,12 @@ public final class DDCTransport: @unchecked Sendable {
                 &bridgeError
             ) {
                 if value.maximum > 0, value.current <= value.maximum {
+                    logSlowOperationIfNeeded(
+                        "DDC read",
+                        display: display,
+                        attempt: attempt,
+                        started: attemptStarted
+                    )
                     return (current: value.current, maximum: value.maximum)
                 }
                 lastInvalidReply = (
@@ -298,6 +326,9 @@ public final class DDCTransport: @unchecked Sendable {
             } else {
                 lastReason = bridgeError?.localizedDescription ?? lastReason
             }
+
+            let attemptDuration = ProcessInfo.processInfo.systemUptime - attemptStarted
+            logger.notice("DDC read attempt \(attempt, privacy: .public) for \(display.name, privacy: .public) failed after \(attemptDuration, format: .fixed(precision: 2)) seconds: \(lastReason, privacy: .public)")
 
             if attempt < attempts, retryDelay > 0 {
                 Thread.sleep(forTimeInterval: retryDelay)
@@ -316,6 +347,17 @@ public final class DDCTransport: @unchecked Sendable {
             displayID: display.id,
             reason: lastReason
         )
+    }
+
+    private func logSlowOperationIfNeeded(
+        _ operation: String,
+        display: DDCDisplay,
+        attempt: Int,
+        started: TimeInterval
+    ) {
+        let duration = ProcessInfo.processInfo.systemUptime - started
+        guard duration >= Self.slowOperationThreshold else { return }
+        logger.notice("\(operation, privacy: .public) attempt \(attempt, privacy: .public) for \(display.name, privacy: .public) took \(duration, format: .fixed(precision: 2)) seconds")
     }
 
     private func serialized<T>(_ body: () throws -> T) rethrows -> T {

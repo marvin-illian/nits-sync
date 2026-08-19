@@ -103,7 +103,12 @@ Tradeoff: it can produce more jitter on noisy monitors or occasionally show
 temporary mismatches after transient DDC errors.
 
 Nits Sync retries a monitor automatically when its first DDC read is busy or
-times out. You can also choose **Refresh Displays** in the menu at any time.
+times out. It also observes both full-system sleep and display-only sleep. After
+a wake it waits two seconds for macOS to rebuild the display services, discovers
+fresh DDC handles, and reapplies the current target. Transient failures continue
+with a bounded 2, 4, 8, then 15-second backoff instead of leaving the monitor in
+a state that requires toggling **Control This Display**. You can still choose
+**Refresh Displays** in the menu at any time.
 
 The preference is persisted as `lowLatencySync` and kept across app launches.
 

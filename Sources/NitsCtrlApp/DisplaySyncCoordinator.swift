@@ -14,8 +14,19 @@ enum CoordinatorPhase: Equatable {
 
 enum SystemPauseReason: Hashable, Sendable {
     case sleep
+    case displaySleep
     case inactiveSession
     case powerOff
+
+    var needsDelayedDisplayRecovery: Bool {
+        self == .sleep || self == .displaySleep
+    }
+
+    var shouldRestoreBeforePause: Bool {
+        // NSWorkspace posts screensDidSleep only after the display hardware is
+        // already asleep, when a synchronous DDC restore may itself stall.
+        self != .displaySleep
+    }
 }
 
 struct ExternalDisplayStatus: Identifiable {
@@ -86,7 +97,10 @@ enum CoordinatorError: LocalizedError {
 /// Owns all DDC work on one serial queue. No producer can race a final restore.
 final class DisplaySyncCoordinator: @unchecked Sendable {
     typealias StateHandler = @Sendable (SyncAppSnapshot) -> Void
-    private static let maximumAutomaticWriteAttempts = 2
+    /// DCP display services can still be stale when the workspace first posts
+    /// its wake notification. Give macOS a short window to rebuild them before
+    /// performing synchronous DDC discovery and reads.
+    private static let wakeRecoveryDelay: TimeInterval = 2
     /// Live writes are intentionally not read back one-by-one. Waiting for a
     /// short quiet period lets slow DDC firmware finish the newest command and
     /// prevents rapid key presses from queueing stale verification work.
@@ -128,6 +142,8 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
     private var displayRetryDelay: TimeInterval = 2
     private var isRetryingDisplays = false
     private var writeRetryStates: [String: (rawValue: UInt16, attempts: Int)] = [:]
+    private var wakeRecoveryWorkItem: DispatchWorkItem?
+    private var needsWakeRecovery = false
     private var liveVerificationWorkItems: [String: DispatchWorkItem] = [:]
     private var liveVerificationTokens: [String: UInt64] = [:]
     private var liveVerificationSequence: UInt64 = 0
@@ -236,7 +252,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
 
     func refreshDisplays() {
         queue.async { [weak self] in
-            guard let self, self.phase != .quiescing, self.phase != .stopped else {
+            guard let self,
+                  !self.isSystemPaused,
+                  self.wakeRecoveryWorkItem == nil,
+                  self.phase != .quiescing,
+                  self.phase != .stopped else {
                 return
             }
             self.writeRetryStates.removeAll()
@@ -256,6 +276,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             self.syncEnabled = enabled
 
             if enabled {
+                if self.wakeRecoveryWorkItem != nil {
+                    self.publishUnlocked()
+                    Self.complete(completion, with: .success(()))
+                    return
+                }
                 self.refreshDisplaysUnlocked()
                 self.startFollowingUnlocked()
                 self.publishUnlocked()
@@ -280,6 +305,9 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             guard let self,
                   let display = self.displays[displayID],
                   var profile = self.profileUnlocked(for: display) else { return }
+            // Treat an explicit off/on as a request to try immediately instead
+            // of retaining any backoff state from an earlier transient error.
+            self.writeRetryStates[displayID] = nil
             profile.isEnabled = enabled
             do {
                 try self.profiles.upsert(profile)
@@ -608,10 +636,17 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             }
             let wasPaused = self.isSystemPaused
             self.systemPauseReasons.insert(reason)
+            if reason.needsDelayedDisplayRecovery {
+                self.needsWakeRecovery = true
+            }
+            self.cancelWakeRecoveryUnlocked()
+            self.logger.notice("Pausing display sync for system event: \(String(describing: reason), privacy: .public)")
             guard !wasPaused else { return }
             self.stopFollowingUnlocked()
             self.phase = .paused
-            _ = self.restoreCurrentSessionUnlocked()
+            if reason.shouldRestoreBeforePause {
+                _ = self.restoreCurrentSessionUnlocked()
+            }
             self.publishUnlocked()
         }
     }
@@ -623,11 +658,13 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             }
             guard self.systemPauseReasons.remove(reason) != nil,
                   !self.isSystemPaused else { return }
-            self.refreshDisplaysUnlocked()
-            if self.syncEnabled, self.calibration == nil {
-                self.startFollowingUnlocked()
-            } else if self.calibration != nil {
-                self.startCalibrationObservationUnlocked()
+            self.logger.notice("Resuming display sync after system event: \(String(describing: reason), privacy: .public)")
+            if self.needsWakeRecovery {
+                self.needsWakeRecovery = false
+                self.scheduleWakeRecoveryUnlocked()
+            } else {
+                self.refreshDisplaysUnlocked()
+                self.resumeFollowingIfAppropriateUnlocked()
             }
             self.publishUnlocked()
         }
@@ -742,6 +779,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         nitsReader.stopPolling()
         cancelDisplayRetryUnlocked()
         cancelAllLiveVerificationsUnlocked()
+        cancelWakeRecoveryUnlocked()
     }
 
     private func resumeFollowingIfAppropriateUnlocked() {
@@ -754,10 +792,41 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         }
     }
 
+    private func scheduleWakeRecoveryUnlocked() {
+        cancelWakeRecoveryUnlocked()
+        phase = .paused
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.wakeRecoveryWorkItem = nil
+            guard !self.isSystemPaused,
+                  self.phase != .quiescing,
+                  self.phase != .stopped else { return }
+            self.logger.notice("Starting delayed display rediscovery after wake")
+            self.refreshDisplaysUnlocked()
+            self.resumeFollowingIfAppropriateUnlocked()
+            self.publishUnlocked()
+        }
+        wakeRecoveryWorkItem = workItem
+        queue.asyncAfter(
+            deadline: .now() + Self.wakeRecoveryDelay,
+            execute: workItem
+        )
+    }
+
+    private func cancelWakeRecoveryUnlocked() {
+        wakeRecoveryWorkItem?.cancel()
+        wakeRecoveryWorkItem = nil
+    }
+
     private func refreshDisplaysUnlocked() {
         let wasRetrying = isRetryingDisplays
+        let discoveryStarted = ProcessInfo.processInfo.systemUptime
         do {
             let found = try ddc.discover()
+            let discoveryDuration = ProcessInfo.processInfo.systemUptime - discoveryStarted
+            if discoveryDuration >= 1 {
+                logger.notice("External display discovery took \(discoveryDuration, format: .fixed(precision: 2)) seconds")
+            }
             displays = Dictionary(uniqueKeysWithValues: found.map { ($0.id, $0) })
             rawValues = rawValues.filter { displays[$0.key] != nil }
             estimatedNits = estimatedNits.filter { displays[$0.key] != nil }
@@ -775,8 +844,13 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 displays[$0.displayID] == nil
             } ?? false)
             for display in found {
+                let readStarted = ProcessInfo.processInfo.systemUptime
                 do {
                     let raw = try ddc.readBrightness(display)
+                    let readDuration = ProcessInfo.processInfo.systemUptime - readStarted
+                    if readDuration >= 1 {
+                        logger.notice("DDC brightness read for \(display.name, privacy: .public) took \(readDuration, format: .fixed(precision: 2)) seconds")
+                    }
                     rawValues[display.id] = raw
                     if profiles.profile(for: display.identity) == nil {
                         let maxNits = EDIDLuminance.maximumNits(from: display.edidData) ?? 350
@@ -791,21 +865,15 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                             calibration: curve
                         ))
                     }
-                    if (writeRetryStates[display.id]?.attempts ?? 0) <
-                        Self.maximumAutomaticWriteAttempts {
+                    if writeRetryStates[display.id] == nil {
                         displayErrors[display.id] = nil
                     }
                 } catch {
+                    let readDuration = ProcessInfo.processInfo.systemUptime - readStarted
+                    logger.notice("DDC brightness read failed for \(display.name, privacy: .public) after \(readDuration, format: .fixed(precision: 2)) seconds: \(error.localizedDescription, privacy: .public)")
+                    rawValues[display.id] = nil
                     displayErrors[display.id] = error.localizedDescription
                     needsRetry = true
-                }
-            }
-            if needsRetry {
-                _ = scheduleDisplayRetryUnlocked()
-            } else {
-                cancelDisplayRetryUnlocked()
-                if wasRetrying {
-                    message = nil
                 }
             }
             // Keep discovery and crash recovery inseparable. This prevents a
@@ -813,7 +881,18 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             // session's durable baseline has been considered.
             recoverInterruptedSessionsUnlocked()
             _ = restoreCurrentSessionUnlocked(pendingOnly: true)
+            let hasConnectedPendingRestore = sessionEntries.values.contains {
+                $0.state == .restorePending && displays[$0.identity.stableKey] != nil
+            }
+            needsRetry = needsRetry || hasConnectedPendingRestore
+            if needsRetry {
+                _ = scheduleDisplayRetryUnlocked()
+            } else if wasRetrying {
+                message = nil
+            }
         } catch {
+            let discoveryDuration = ProcessInfo.processInfo.systemUptime - discoveryStarted
+            logger.notice("External display discovery failed after \(discoveryDuration, format: .fixed(precision: 2)) seconds: \(error.localizedDescription, privacy: .public)")
             let scheduled = scheduleDisplayRetryUnlocked()
             message = error.localizedDescription +
                 (scheduled ? " Retrying automatically." : "")
@@ -832,6 +911,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         }
 
         isRetryingDisplays = true
+        let scheduledDelay = displayRetryDelay
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.displayRetryWorkItem = nil
@@ -844,12 +924,44 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             if let sourceNits = self.sourceNits, self.phase == .syncing {
                 self.applySourceNitsUnlocked(sourceNits)
             }
+            self.reconcileDisplayRetryUnlocked()
             self.publishUnlocked()
         }
         displayRetryWorkItem = workItem
-        queue.asyncAfter(deadline: .now() + displayRetryDelay, execute: workItem)
+        logger.notice("Scheduling display recovery in \(scheduledDelay, format: .fixed(precision: 1)) seconds")
+        queue.asyncAfter(deadline: .now() + scheduledDelay, execute: workItem)
         displayRetryDelay = min(displayRetryDelay * 2, 15)
         return true
+    }
+
+    private func reconcileDisplayRetryUnlocked() {
+        guard canRetryDisplaysUnlocked else {
+            cancelDisplayRetryUnlocked()
+            return
+        }
+
+        let lacksReadyDisplay = displays.isEmpty || displays.values.contains {
+            rawValues[$0.id] == nil || profileUnlocked(for: $0) == nil
+        }
+        let hasPendingWrite = phase == .syncing && writeRetryStates.contains {
+            displayID, _ in
+            guard let display = displays[displayID],
+                  !blockedDisplays.contains(displayID) else { return false }
+            return profileUnlocked(for: display)?.isEnabled == true
+        }
+        let hasConnectedPendingRestore = sessionEntries.values.contains {
+            $0.state == .restorePending && displays[$0.identity.stableKey] != nil
+        }
+        let calibrationDisplayIsMissing = calibration.map {
+            displays[$0.displayID] == nil || rawValues[$0.displayID] == nil
+        } ?? false
+
+        if lacksReadyDisplay || hasPendingWrite || hasConnectedPendingRestore ||
+            calibrationDisplayIsMissing {
+            _ = scheduleDisplayRetryUnlocked()
+        } else {
+            cancelDisplayRetryUnlocked()
+        }
     }
 
     private var canRetryDisplaysUnlocked: Bool {
@@ -871,11 +983,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         if let message, message.hasSuffix(automaticSuffix) {
             self.message = String(message.dropLast(automaticSuffix.count))
         }
-        let singleRetrySuffix = " Retrying once."
+        let retrySuffix = " Retrying automatically."
         for (displayID, error) in displayErrors.filter({
-            $0.value.hasSuffix(singleRetrySuffix)
+            $0.value.hasSuffix(retrySuffix)
         }) {
-            displayErrors[displayID] = String(error.dropLast(singleRetrySuffix.count)) +
+            displayErrors[displayID] = String(error.dropLast(retrySuffix.count)) +
                 " Choose Refresh Displays to try again."
         }
         isRetryingDisplays = false
@@ -956,6 +1068,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         for display in displays.values.sorted(by: { $0.id < $1.id }) {
             if let displayIDs, !displayIDs.contains(display.id) { continue }
             guard !blockedDisplays.contains(display.id),
+                  rawValues[display.id] != nil,
                   let profile = profileUnlocked(for: display),
                   let target = policy.target(for: nits, profile: profile) else {
                 continue
@@ -965,8 +1078,8 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             if writeRetryStates[display.id]?.rawValue != target.rawValue {
                 writeRetryStates[display.id] = nil
             }
-            if let retry = writeRetryStates[display.id],
-               retry.attempts >= Self.maximumAutomaticWriteAttempts {
+            if writeRetryStates[display.id] != nil,
+               displayRetryWorkItem != nil {
                 continue
             }
             if rawValues[display.id]?.current == target.rawValue {
@@ -1029,6 +1142,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                     )
                 }
             } catch {
+                logger.notice("Could not prepare live sync for \(display.name, privacy: .public), target \(target.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 recordRetryableWriteFailureUnlocked(
                     error,
                     displayID: display.id,
@@ -1037,6 +1151,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             }
         }
         updateActivityUnlocked()
+        reconcileDisplayRetryUnlocked()
     }
 
     /// Verifies only the newest live target after DDC traffic has gone quiet.
@@ -1062,6 +1177,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 didReapply: didReapply
             )
             self.updateActivityUnlocked()
+            self.reconcileDisplayRetryUnlocked()
             self.publishUnlocked()
         }
         liveVerificationWorkItems[displayID] = workItem
@@ -1086,7 +1202,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             readback = try ddc.readBrightness(display)
             rawValues[displayID] = readback
         } catch {
-            displayErrors[displayID] = "Could not verify the latest brightness yet. The next change will try again."
+            markTargetForAutomaticRetryUnlocked(
+                displayID: displayID,
+                targetRawValue: targetRawValue
+            )
+            displayErrors[displayID] = "Could not verify the latest brightness yet. Retrying automatically."
             logger.notice("Deferred brightness read failed for \(display.name, privacy: .public), target \(targetRawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
             return
         }
@@ -1108,7 +1228,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         }
 
         guard !didReapply else {
-            displayErrors[displayID] = "The monitor reported brightness \(readback.current) after target \(targetRawValue). The next change will try again."
+            markTargetForAutomaticRetryUnlocked(
+                displayID: displayID,
+                targetRawValue: targetRawValue
+            )
+            displayErrors[displayID] = "The monitor reported brightness \(readback.current) after target \(targetRawValue). Retrying automatically."
             logger.notice("Deferred brightness verification mismatch for \(display.name, privacy: .public): target \(targetRawValue, privacy: .public), received \(readback.current, privacy: .public)")
             return
         }
@@ -1133,7 +1257,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 didReapply: true
             )
         } catch {
-            displayErrors[displayID] = "The monitor did not accept the latest brightness. The next change will try again."
+            markTargetForAutomaticRetryUnlocked(
+                displayID: displayID,
+                targetRawValue: targetRawValue
+            )
+            displayErrors[displayID] = "The monitor did not accept the latest brightness. Retrying automatically."
             logger.notice("Live target reapply failed for \(display.name, privacy: .public), target \(targetRawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
     }
@@ -1167,21 +1295,27 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         displayID: String,
         targetRawValue: UInt16
     ) {
-        let previousAttempts = writeRetryStates[displayID].flatMap {
-            $0.rawValue == targetRawValue ? $0.attempts : nil
-        } ?? 0
-        let attempts = previousAttempts + 1
-        writeRetryStates[displayID] = (targetRawValue, attempts)
-
-        if attempts < Self.maximumAutomaticWriteAttempts {
-            if scheduleDisplayRetryUnlocked() {
-                displayErrors[displayID] = "\(error.localizedDescription) Retrying once."
-            } else {
-                displayErrors[displayID] = "\(error.localizedDescription) Choose Refresh Displays to try again."
-            }
+        markTargetForAutomaticRetryUnlocked(
+            displayID: displayID,
+            targetRawValue: targetRawValue
+        )
+        if displayRetryWorkItem != nil {
+            displayErrors[displayID] = "\(error.localizedDescription) Retrying automatically."
         } else {
             displayErrors[displayID] = "\(error.localizedDescription) Choose Refresh Displays to try again."
         }
+    }
+
+    private func markTargetForAutomaticRetryUnlocked(
+        displayID: String,
+        targetRawValue: UInt16
+    ) {
+        let previousAttempts = writeRetryStates[displayID].flatMap {
+            $0.rawValue == targetRawValue ? $0.attempts : nil
+        } ?? 0
+        let attempts = previousAttempts == Int.max ? Int.max : previousAttempts + 1
+        writeRetryStates[displayID] = (targetRawValue, attempts)
+        _ = scheduleDisplayRetryUnlocked()
     }
 
     private func captureBaselineIfNeededUnlocked(
@@ -1190,7 +1324,19 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         if let entry = sessionEntries[display.id] {
             return entry
         }
-        let current = try ddc.readBrightness(display)
+        let readStarted = ProcessInfo.processInfo.systemUptime
+        let current: (current: UInt16, maximum: UInt16)
+        do {
+            current = try ddc.readBrightness(display)
+        } catch {
+            let readDuration = ProcessInfo.processInfo.systemUptime - readStarted
+            logger.notice("Baseline DDC read failed for \(display.name, privacy: .public) after \(readDuration, format: .fixed(precision: 2)) seconds: \(error.localizedDescription, privacy: .public)")
+            throw error
+        }
+        let readDuration = ProcessInfo.processInfo.systemUptime - readStarted
+        if readDuration >= 1 {
+            logger.notice("Baseline DDC read for \(display.name, privacy: .public) took \(readDuration, format: .fixed(precision: 2)) seconds")
+        }
         rawValues[display.id] = current
         let entry = RestoreJournalEntry(
             identity: display.identity,
@@ -1224,6 +1370,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 failures.append(profileNameUnlocked(for: entry.identity))
                 continue
             }
+            let restoreStarted = ProcessInfo.processInfo.systemUptime
             do {
                 var pending = entry
                 pending.markRestorePending()
@@ -1240,7 +1387,13 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 blockedDisplays.remove(key)
                 displayErrors[key] = nil
                 lastLiveWriteUptime[key] = nil
+                let restoreDuration = ProcessInfo.processInfo.systemUptime - restoreStarted
+                if restoreDuration >= 1 {
+                    logger.notice("Brightness restore for \(display.name, privacy: .public) took \(restoreDuration, format: .fixed(precision: 2)) seconds")
+                }
             } catch {
+                let restoreDuration = ProcessInfo.processInfo.systemUptime - restoreStarted
+                logger.notice("Brightness restore failed for \(display.name, privacy: .public) after \(restoreDuration, format: .fixed(precision: 2)) seconds: \(error.localizedDescription, privacy: .public)")
                 blockedDisplays.insert(key)
                 displayErrors[key] = "Restore failed: \(error.localizedDescription)"
                 failures.append(display.name)
@@ -1339,6 +1492,9 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             )
         }
         let diagnosticMessage = message
+            ?? (wakeRecoveryWorkItem != nil
+                ? "Waiting briefly for display hardware after wake."
+                : nil)
             ?? (isRetryingDisplays ? "Waiting for display hardware; retrying automatically." : nil)
             ?? {
                 guard syncEnabled else { return nil }
