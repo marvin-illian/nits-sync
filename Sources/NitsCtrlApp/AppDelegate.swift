@@ -108,7 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             self?.calibrationReferences.refreshScreens()
-            self?.coordinator.refreshDisplays()
+            self?.coordinator.displayConfigurationChanged()
         })
 
         let workspaceCenter = NSWorkspace.shared.notificationCenter

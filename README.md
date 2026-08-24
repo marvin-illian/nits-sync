@@ -55,7 +55,10 @@ into the monitor's range.
 
 Nits Sync listens for the built-in display's native macOS brightness-change
 notifications and reads physical nits only when a change occurs. A one-second
-watchdog catches notifications missed during sleep or a display transition.
+watchdog catches notifications missed during sleep or a display transition and
+redelivers a liveness heartbeat so a callback dropped during wake cannot leave
+the external display stale. Heartbeats already accepted by the coordinator are
+ignored and do not produce another DDC write or UI update.
 If that private notification interface is unavailable on a macOS version, the
 app falls back to timer sampling. Each notification gets a fast read and one
 event-triggered follow-up at 120 ms in case macOS published physical nits late.
@@ -103,12 +106,15 @@ Tradeoff: it can produce more jitter on noisy monitors or occasionally show
 temporary mismatches after transient DDC errors.
 
 Nits Sync retries a monitor automatically when its first DDC read is busy or
-times out. It also observes both full-system sleep and display-only sleep. After
-a wake it waits two seconds for macOS to rebuild the display services, discovers
+times out. Connect/disconnect notifications are coalesced for 750 ms so macOS
+can finish creating the new monitor's I/O services before the first DDC read.
+Nits Sync also observes both full-system sleep and display-only sleep. After a
+wake it waits two seconds for macOS to rebuild the display services, discovers
 fresh DDC handles, and reapplies the current target. Transient failures continue
-with a bounded 2, 4, 8, then 15-second backoff instead of leaving the monitor in
-a state that requires toggling **Control This Display**. You can still choose
-**Refresh Displays** in the menu at any time.
+with a bounded 2, 4, 8, then 15-second backoff. Retry reservations expire at
+their monotonic deadline, and the source watchdog replaces an overdue callback,
+so a dropped timer during a display transition cannot suppress later recovery.
+You can still choose **Refresh Displays** in the menu at any time.
 
 The preference is persisted as `lowLatencySync` and kept across app launches.
 

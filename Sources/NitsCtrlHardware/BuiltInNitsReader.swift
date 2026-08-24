@@ -36,6 +36,9 @@ public final class BuiltInNitsReader: @unchecked Sendable {
 
     /// Notifications are the primary source. This infrequent timer catches a
     /// missed event after sleep or an internal macOS display-state transition.
+    /// In notification mode it also redelivers the current value as a liveness
+    /// heartbeat, because a callback queued during a wake transition can be
+    /// intentionally discarded by the coordinator's generation guard.
     public static let notificationWatchdogInterval: TimeInterval = 1.0
 
     private let pollingInterval: TimeInterval
@@ -137,8 +140,12 @@ public final class BuiltInNitsReader: @unchecked Sendable {
             unregisterForBrightnessChanges(displayID: observedDisplayID)
         }
 
+        let forceWatchdogDelivery = observedDisplayID != nil
         source.setEventHandler { [weak self] in
-            self?.poll(generation: generation)
+            self?.poll(
+                generation: generation,
+                forceDelivery: forceWatchdogDelivery
+            )
         }
         let repeatingInterval = observedDisplayID == nil
             ? pollingInterval
@@ -178,16 +185,19 @@ public final class BuiltInNitsReader: @unchecked Sendable {
         }
     }
 
-    private func poll(generation: UInt64) {
+    private func poll(generation: UInt64, forceDelivery: Bool = false) {
         guard let nits = currentNits() else { return }
 
         stateLock.lock()
         let isCurrentPoller = generation == pollingGeneration && timer != nil
-        let crossedDeadband = lastDeliveredNits.map {
-            abs(nits - $0) >= deadbandNits
-        } ?? true
+        let shouldDeliver = Self.shouldDeliverSample(
+            nits,
+            lastDeliveredNits: lastDeliveredNits,
+            deadbandNits: deadbandNits,
+            forceDelivery: forceDelivery
+        )
         var shouldScheduleCallback = false
-        if isCurrentPoller && crossedDeadband {
+        if isCurrentPoller && shouldDeliver {
             lastDeliveredNits = nits
             pendingCallbackNits = nits
             if !callbackScheduled {
@@ -219,6 +229,20 @@ public final class BuiltInNitsReader: @unchecked Sendable {
         if let nits, let handler {
             handler(nits)
         }
+    }
+
+    static func shouldDeliverSample(
+        _ nits: Double,
+        lastDeliveredNits: Double?,
+        deadbandNits: Double,
+        forceDelivery: Bool
+    ) -> Bool {
+        if forceDelivery {
+            return true
+        }
+        return lastDeliveredNits.map {
+            abs(nits - $0) >= deadbandNits
+        } ?? true
     }
 }
 

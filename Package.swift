@@ -42,6 +42,10 @@ let package = Package(
             name: "NitsCtrlCoreTests",
             dependencies: ["NitsCtrlCore"]
         ),
+        .testTarget(
+            name: "NitsCtrlHardwareTests",
+            dependencies: ["NitsCtrlHardware"]
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

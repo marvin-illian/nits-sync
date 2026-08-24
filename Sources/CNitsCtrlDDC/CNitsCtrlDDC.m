@@ -408,7 +408,10 @@ static BOOL CNDDCValidateGetReply(const uint8_t reply[11],
         reply[2] != 0x02) {
         CNDDCAssignError(error, CNDDCMakeError(
             CNDDCErrorMalformedReply,
-            @"The monitor returned a malformed DDC reply header."));
+            [NSString stringWithFormat:
+                @"The monitor returned a malformed DDC reply header "
+                 "(%02x %02x %02x).",
+                reply[0], reply[1], reply[2]]));
         return NO;
     }
 
