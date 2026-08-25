@@ -1464,6 +1464,24 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             let key = entry.identity.stableKey
             cancelLiveVerificationUnlocked(displayID: key)
             waitForLiveWriteToSettleUnlocked(displayID: key)
+
+            // Record the restore requirement before checking whether the
+            // monitor is still connected. A disconnect can race sleep/logout,
+            // and leaving the entry as merely `modified` makes the reconnect
+            // path skip it forever because that path intentionally processes
+            // only pending restores.
+            var pending = entry
+            pending.markRestorePending()
+            sessionEntries[key] = pending
+            do {
+                _ = try journalStore.upsert(pending)
+            } catch {
+                blockedDisplays.insert(key)
+                displayErrors[key] = "Original brightness restore could not be recorded: \(error.localizedDescription)"
+                failures.append(profileNameUnlocked(for: entry.identity))
+                continue
+            }
+
             guard let display = displays[key] else {
                 blockedDisplays.insert(key)
                 displayErrors[key] = "Original brightness restore is pending until this monitor reconnects."
@@ -1472,10 +1490,6 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             }
             let restoreStarted = ProcessInfo.processInfo.systemUptime
             do {
-                var pending = entry
-                pending.markRestorePending()
-                _ = try journalStore.upsert(pending)
-                sessionEntries[key] = pending
                 try restoreEntryUnlocked(pending, display: display)
                 sessionEntries[key] = nil
                 rawValues[key] = (
@@ -1603,7 +1617,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                     return isSystemPaused
                         ? "Sync is temporarily paused (system event)."
                         : "Sync is paused. Open the monitor entry for last reported error."
-                case .syncing where !blockedDisplays.isEmpty:
+                case .syncing where statuses.contains(where: { $0.isBlocked }):
                     return "Some displays are paused while resolving writes. Open each monitor for details."
                 case .quiescing, .starting, .stopped:
                     return nil
