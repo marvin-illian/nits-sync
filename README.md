@@ -114,6 +114,9 @@ fresh DDC handles, and reapplies the current target. Transient failures continue
 with a bounded 2, 4, 8, then 15-second backoff. Retry reservations expire at
 their monotonic deadline, and the source watchdog replaces an overdue callback,
 so a dropped timer during a display transition cannot suppress later recovery.
+EDID discovery is also bounded per hardware service: a stale projector or
+monitor proxy is skipped after two seconds instead of blocking control of newly
+connected displays.
 You can still choose **Refresh Displays** in the menu at any time.
 
 The preference is persisted as `lowLatencySync` and kept across app launches.

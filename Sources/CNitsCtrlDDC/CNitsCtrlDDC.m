@@ -1,5 +1,6 @@
 #import "CNitsCtrlDDC.h"
 
+#import <dispatch/dispatch.h>
 #import <IOKit/IOKitLib.h>
 #import <string.h>
 #import <unistd.h>
@@ -46,6 +47,10 @@ static const uint32_t CNDDCMCDP29XXChipAddress = 0xb7;
 static const uint32_t CNDDCCommandAddress = 0x51;
 static const uint8_t CNDDCHostAddress = 0x50;
 static const uint8_t CNDDCDisplayAddress = 0x6e;
+// IOAVServiceCopyEDID can remain blocked after its display is unplugged while
+// macOS is rebuilding DCP services. Never let one stale proxy stop discovery
+// of the displays that are still connected.
+static const int64_t CNDDCEDIDCopyTimeoutNanoseconds = 2 * NSEC_PER_SEC;
 
 @interface CNDDCDisplay ()
 
@@ -80,6 +85,96 @@ static NSError *CNDDCMakeIOError(NSString *operation, IOReturn result) {
     NSString *description = [NSString stringWithFormat:
         @"%@ failed (IOKit status 0x%08x).", operation, result];
     return CNDDCMakeError(CNDDCErrorIOFailed, description);
+}
+
+static NSLock *CNDDCEDIDReadLock(void) {
+    static NSLock *lock;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        lock = [[NSLock alloc] init];
+    });
+    return lock;
+}
+
+static NSMutableSet<NSNumber *> *CNDDCEDIDReadsInFlight(void) {
+    static NSMutableSet<NSNumber *> *entryIDs;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        entryIDs = [NSMutableSet set];
+    });
+    return entryIDs;
+}
+
+/// Reserves one EDID request per registry entry. A request that times out may
+/// still be stuck inside the unheadered macOS API, so later discoveries skip
+/// that entry instead of accumulating blocked worker threads. The worker
+/// releases the reservation if the system call eventually returns.
+static BOOL CNDDCBeginEDIDRead(uint64_t registryEntryID) {
+    NSNumber *entryID = @(registryEntryID);
+    NSLock *lock = CNDDCEDIDReadLock();
+    [lock lock];
+    BOOL canBegin = ![CNDDCEDIDReadsInFlight() containsObject:entryID];
+    if (canBegin) {
+        [CNDDCEDIDReadsInFlight() addObject:entryID];
+    }
+    [lock unlock];
+    return canBegin;
+}
+
+static void CNDDCEndEDIDRead(uint64_t registryEntryID) {
+    NSLock *lock = CNDDCEDIDReadLock();
+    [lock lock];
+    [CNDDCEDIDReadsInFlight() removeObject:@(registryEntryID)];
+    [lock unlock];
+}
+
+static NSData *CNDDCCopyEDIDWithTimeout(IOAVServiceRef avService,
+                                        uint64_t registryEntryID,
+                                        BOOL *timedOut) {
+    if (timedOut != NULL) {
+        *timedOut = NO;
+    }
+    if (!CNDDCBeginEDIDRead(registryEntryID)) {
+        if (timedOut != NULL) {
+            *timedOut = YES;
+        }
+        return nil;
+    }
+
+    dispatch_group_t group = dispatch_group_create();
+    __block NSData *edidData = [NSData data];
+
+    // The discovery loop owns its reference only until this helper returns.
+    // Keep a separate reference alive if the system call outlives the timeout.
+    CFRetain(avService);
+    dispatch_group_async(
+        group,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ^{
+            @autoreleasepool {
+                CFDataRef copiedEDID = NULL;
+                IOReturn result = IOAVServiceCopyEDID(avService, &copiedEDID);
+                if (result == kIOReturnSuccess && copiedEDID != NULL) {
+                    edidData = [(__bridge NSData *)copiedEDID copy];
+                }
+                if (copiedEDID != NULL) {
+                    CFRelease(copiedEDID);
+                }
+                CNDDCEndEDIDRead(registryEntryID);
+                CFRelease(avService);
+            }
+        });
+
+    long waitResult = dispatch_group_wait(
+        group,
+        dispatch_time(DISPATCH_TIME_NOW, CNDDCEDIDCopyTimeoutNanoseconds));
+    if (waitResult != 0) {
+        if (timedOut != NULL) {
+            *timedOut = YES;
+        }
+        return nil;
+    }
+    return edidData;
 }
 
 static void CNDDCAssignError(NSError **destination, NSError *error) {
@@ -309,6 +404,9 @@ NSArray<CNDDCDisplay *> *CNDDCDiscoverExternalDisplays(NSError **error) {
             }
             externalProxyCount += 1;
 
+            uint64_t entryID = 0;
+            (void)IORegistryEntryGetRegistryEntryID(service, &entryID);
+
             IOAVServiceRef avService = IOAVServiceCreateWithService(
                 kCFAllocatorDefault, service);
             if (avService == NULL) {
@@ -318,18 +416,18 @@ NSArray<CNDDCDisplay *> *CNDDCDiscoverExternalDisplays(NSError **error) {
 
             NSData *edidData = [NSData data];
             if (IOAVServiceCopyEDID != NULL) {
-                CFDataRef copiedEDID = NULL;
-                IOReturn edidResult = IOAVServiceCopyEDID(avService, &copiedEDID);
-                if (edidResult == kIOReturnSuccess && copiedEDID != NULL) {
-                    edidData = [(__bridge NSData *)copiedEDID copy];
+                BOOL edidTimedOut = NO;
+                NSData *copiedEDID = CNDDCCopyEDIDWithTimeout(
+                    avService, entryID, &edidTimedOut);
+                if (edidTimedOut) {
+                    CFRelease(avService);
+                    IOObjectRelease(service);
+                    continue;
                 }
-                if (copiedEDID != NULL) {
-                    CFRelease(copiedEDID);
+                if (copiedEDID != nil) {
+                    edidData = copiedEDID;
                 }
             }
-
-            uint64_t entryID = 0;
-            (void)IORegistryEntryGetRegistryEntryID(service, &entryID);
 
             io_string_t pathBuffer = {0};
             NSString *registryPath = @"";
@@ -359,7 +457,7 @@ NSArray<CNDDCDisplay *> *CNDDCDiscoverExternalDisplays(NSError **error) {
     if (externalProxyCount > 0 && displays.count == 0) {
         CNDDCAssignError(error, CNDDCMakeError(
             CNDDCErrorDisplayUnavailable,
-            @"macOS exposed an external display proxy but did not create its I/O service."));
+            @"macOS exposed an external display proxy, but its I/O service did not become ready."));
         return nil;
     }
 
