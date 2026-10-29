@@ -36,7 +36,6 @@ typedef struct {
 @property(nonatomic, readonly) uint64_t registryEntryID;
 @property(nonatomic, readonly, copy) NSString *registryPath;
 @property(nonatomic, readonly) uint32_t chipAddress;
-@property(nonatomic, readonly) BOOL edidIsValid;
 
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;

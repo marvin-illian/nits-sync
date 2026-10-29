@@ -13,13 +13,9 @@ public final class DDCDisplay: @unchecked Sendable, Identifiable {
     public let productID: UInt32
     public let serialNumber: UInt32?
     public let alphanumericSerial: String?
-    public let edidUUID: UUID?
     public let edidData: Data
     public let identity: ExternalDisplayIdentity
-    public let registryEntryID: UInt64
     public let registryPath: String
-    public let ddcChipAddress: UInt32
-    public let hasValidEDID: Bool
 
     fileprivate let service: CNDDCDisplay
 
@@ -29,10 +25,7 @@ public final class DDCDisplay: @unchecked Sendable, Identifiable {
         manufacturerID = service.manufacturerID
         vendorID = UInt32(service.manufacturerCode)
         productID = UInt32(service.productCode)
-        registryEntryID = service.registryEntryID
         registryPath = service.registryPath
-        ddcChipAddress = service.chipAddress
-        hasValidEDID = service.edidIsValid
 
         let rawSerial = service.numericSerialNumber
         if rawSerial == 0 || rawSerial == UInt32.max {
@@ -44,20 +37,16 @@ public final class DDCDisplay: @unchecked Sendable, Identifiable {
         alphanumericSerial = Self.nonempty(service.alphanumericSerialNumber)
         name = Self.nonempty(service.productName) ?? "External Display"
 
-        let edidHash = edidData.isEmpty ? nil : Self.sha256Hex(edidData)
-        edidUUID = edidData.isEmpty ? nil : Self.uuidFromEDID(edidData)
-
-        // A hash-derived UUID is useful as compact metadata but is not a
-        // ColorSync UUID and cannot distinguish two panels with identical
-        // EDIDs. Keep it out of displayUUID so the core identity also includes
-        // the transport path when a real serial is absent.
+        // Discovery only reports services with a base EDID block. Without a
+        // real serial, the core identity also includes the transport path so
+        // two panels with identical EDIDs are not conflated.
         identity = ExternalDisplayIdentity(
             vendorID: vendorID,
             productID: productID,
             serialNumber: serialNumber,
             alphanumericSerialNumber: alphanumericSerial,
             displayUUID: nil,
-            edidHash: edidHash,
+            edidHash: Self.sha256Hex(edidData),
             transportPath: Self.nonempty(registryPath)
         )
         id = identity.stableKey
@@ -71,20 +60,6 @@ public final class DDCDisplay: @unchecked Sendable, Identifiable {
 
     private static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func uuidFromEDID(_ data: Data) -> UUID {
-        var bytes = Array(SHA256.hash(data: data).prefix(16))
-        // Use the custom UUID version while retaining the deterministic EDID
-        // digest payload.
-        bytes[6] = (bytes[6] & 0x0f) | 0x80
-        bytes[8] = (bytes[8] & 0x3f) | 0x80
-        return UUID(uuid: (
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[8], bytes[9], bytes[10], bytes[11],
-            bytes[12], bytes[13], bytes[14], bytes[15]
-        ))
     }
 }
 
@@ -158,8 +133,10 @@ public final class DDCTransport: @unchecked Sendable {
         }
     }
 
+    /// Returns at most one display per identity key. Profiles and restore
+    /// records are keyed by that identity, so callers can index the result.
     public func discover() throws -> [DDCDisplay] {
-        try serialized {
+        let displays = try serialized {
             var bridgeError: NSError?
             guard let services = CNDDCDiscoverExternalDisplays(&bridgeError) else {
                 throw Self.operationError(
@@ -170,6 +147,20 @@ public final class DDCTransport: @unchecked Sendable {
             }
             return services.map(DDCDisplay.init(service:))
         }
+        // Projectors and splitters often publish identical EDIDs with a
+        // placeholder serial, and a stale proxy can briefly coexist with its
+        // replacement during a display switch. Keep the first service in the
+        // bridge's deterministic registry-path order.
+        let unique = Self.firstOfEachID(displays)
+        for duplicate in displays where !unique.contains(where: { $0 === duplicate }) {
+            logger.notice("Ignoring DDC service for \(duplicate.name, privacy: .public) at \(duplicate.registryPath, privacy: .public): another connected display has the same identity")
+        }
+        return unique
+    }
+
+    static func firstOfEachID<Element: Identifiable>(_ elements: [Element]) -> [Element] {
+        var seen = Set<Element.ID>()
+        return elements.filter { seen.insert($0.id).inserted }
     }
 
     public func readBrightness(

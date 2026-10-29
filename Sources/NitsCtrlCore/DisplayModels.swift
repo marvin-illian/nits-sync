@@ -212,16 +212,6 @@ public struct DisplayProfileStore: Codable, Hashable, Sendable {
         }
     }
 
-    @discardableResult
-    public mutating func removeProfile(for identity: ExternalDisplayIdentity) -> DisplayProfile? {
-        guard let index = profiles.firstIndex(where: {
-            $0.identity.matchesForPersistence(identity)
-        }) else {
-            return nil
-        }
-        return profiles.remove(at: index)
-    }
-
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
         case profiles

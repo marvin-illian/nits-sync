@@ -146,12 +146,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
     private var displayRetryDelay: TimeInterval = 2
     private var isRetryingDisplays = false
     private var displayConfigurationGeneration: UInt64 = 0
-    private var writeRetryStates: [String: (rawValue: UInt16, attempts: Int)] = [:]
+    /// Target raw value awaiting an automatic retry after a failed live write.
+    private var writeRetryStates: [String: UInt16] = [:]
     private var wakeRecoveryWorkItem: DispatchWorkItem?
     private var needsWakeRecovery = false
     private var liveVerificationWorkItems: [String: DispatchWorkItem] = [:]
-    private var liveVerificationTokens: [String: UInt64] = [:]
-    private var liveVerificationSequence: UInt64 = 0
     private var lastLiveWriteUptime: [String: TimeInterval] = [:]
     private let logger = Logger(subsystem: "com.local.nits-sync", category: "coordinator")
 
@@ -265,13 +264,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 return
             }
             self.displayConfigurationGeneration &+= 1
-            self.writeRetryStates.removeAll()
-            self.cancelDisplayRetryUnlocked()
-            self.refreshDisplaysUnlocked()
-            if let sourceNits = self.sourceNits, self.phase == .syncing {
-                self.applySourceNitsUnlocked(sourceNits)
-            }
-            self.publishUnlocked()
+            self.refreshAndReapplyUnlocked()
         }
     }
 
@@ -299,15 +292,21 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                       self.phase != .stopped else { return }
 
                 self.logger.notice("Refreshing displays after a hardware configuration change")
-                self.writeRetryStates.removeAll()
-                self.cancelDisplayRetryUnlocked()
-                self.refreshDisplaysUnlocked()
-                if let sourceNits = self.sourceNits, self.phase == .syncing {
-                    self.applySourceNitsUnlocked(sourceNits)
-                }
-                self.publishUnlocked()
+                self.refreshAndReapplyUnlocked()
             }
         }
+    }
+
+    /// Explicit refreshes start from a clean slate instead of inheriting an
+    /// earlier backoff.
+    private func refreshAndReapplyUnlocked() {
+        writeRetryStates.removeAll()
+        cancelDisplayRetryUnlocked()
+        refreshDisplaysUnlocked()
+        if let sourceNits, phase == .syncing {
+            applySourceNitsUnlocked(sourceNits)
+        }
+        publishUnlocked()
     }
 
     func setSyncEnabled(_ enabled: Bool, completion: ((Result<Void, Error>) -> Void)? = nil) {
@@ -797,6 +796,10 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                 self.reconcileDisplayRetryUnlocked()
             }
         }
+        // Restores, calibration, and pauses leave the monitors away from the
+        // sync target while the cached source value stays unchanged, so the
+        // reader's deadband would otherwise wait for a brightness change.
+        reapplyCurrentSourceUnlocked()
     }
 
     /// Calibration follows the built-in panel read-only. External writes only
@@ -826,7 +829,6 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
 
     private func stopFollowingUnlocked() {
         generation &+= 1
-        displayConfigurationGeneration &+= 1
         nitsReader.stopPolling()
         cancelDisplayRetryUnlocked()
         cancelAllLiveVerificationsUnlocked()
@@ -855,7 +857,6 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             self.logger.notice("Starting delayed display rediscovery after wake")
             self.refreshDisplaysUnlocked()
             self.resumeFollowingIfAppropriateUnlocked()
-            self.reapplyCurrentSourceAfterWakeUnlocked()
             self.publishUnlocked()
         }
         wakeRecoveryWorkItem = workItem
@@ -870,25 +871,25 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         wakeRecoveryWorkItem = nil
     }
 
-    /// A wake can race the first source callback: the reader may sample while
-    /// the coordinator is still switching generations, making that callback
-    /// correctly stale. Do not wait for another user brightness change. Apply
-    /// a fresh source sample immediately, or the last valid sample while the
-    /// built-in panel is temporarily unavailable in clamshell transitions.
-    private func reapplyCurrentSourceAfterWakeUnlocked() {
+    /// The reader's first callback can be stale (a generation switch) or
+    /// suppressed by the deadband. Do not wait for another user brightness
+    /// change. Apply a fresh source sample immediately, or the last valid
+    /// sample while the built-in panel is temporarily unavailable in clamshell
+    /// transitions.
+    private func reapplyCurrentSourceUnlocked() {
         guard phase == .syncing else { return }
         let currentSourceNits = nitsReader.currentNits()
         guard let recoveredSourceNits = currentSourceNits ?? sourceNits,
               recoveredSourceNits.isFinite,
               recoveredSourceNits >= 0 else {
-            logger.notice("No valid built-in luminance is available after wake; waiting for the source watchdog")
+            logger.notice("No valid built-in luminance is available; waiting for the source watchdog")
             return
         }
 
         if currentSourceNits == nil {
-            logger.notice("Reapplying cached source luminance after wake: \(recoveredSourceNits, format: .fixed(precision: 2)) nits")
+            logger.notice("Reapplying cached source luminance: \(recoveredSourceNits, format: .fixed(precision: 2)) nits")
         } else {
-            logger.notice("Reapplying current source luminance after wake: \(recoveredSourceNits, format: .fixed(precision: 2)) nits")
+            logger.debug("Reapplying current source luminance: \(recoveredSourceNits, format: .fixed(precision: 2)) nits")
         }
         applySourceNitsUnlocked(recoveredSourceNits)
     }
@@ -973,7 +974,9 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             // Keep discovery and crash recovery inseparable. This prevents a
             // newly connected display from being mutated before an older
             // session's durable baseline has been considered.
-            recoverInterruptedSessionsUnlocked()
+            if recoverInterruptedSessionsUnlocked() {
+                needsRetry = true
+            }
             _ = restoreCurrentSessionUnlocked(pendingOnly: true)
             let hasConnectedPendingRestore = sessionEntries.values.contains {
                 $0.state == .restorePending && displays[$0.identity.stableKey] != nil
@@ -1022,7 +1025,9 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
 
             self.refreshDisplaysUnlocked()
             if let sourceNits = self.sourceNits, self.phase == .syncing {
-                self.applySourceNitsUnlocked(sourceNits)
+                // Discovery may already have reserved the next retry for a
+                // different failing display; this pass is still the retry.
+                self.applySourceNitsUnlocked(sourceNits, isRetryPass: true)
             }
             self.reconcileDisplayRetryUnlocked()
             self.publishUnlocked()
@@ -1075,11 +1080,10 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
     private func cancelDisplayRetryUnlocked() {
         displayRetrySchedule.cancel()
         displayRetryDelay = 2
-        let automaticSuffix = " Retrying automatically."
-        if let message, message.hasSuffix(automaticSuffix) {
-            self.message = String(message.dropLast(automaticSuffix.count))
-        }
         let retrySuffix = " Retrying automatically."
+        if let message, message.hasSuffix(retrySuffix) {
+            self.message = String(message.dropLast(retrySuffix.count))
+        }
         for (displayID, error) in displayErrors.filter({
             $0.value.hasSuffix(retrySuffix)
         }) {
@@ -1089,12 +1093,27 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         isRetryingDisplays = false
     }
 
-    private func recoverInterruptedSessionsUnlocked() {
-        guard let journal = try? journalStore.load() else { return }
+    /// Returns true when a connected display hit a transient DDC error and
+    /// should be retried.
+    @discardableResult
+    private func recoverInterruptedSessionsUnlocked() -> Bool {
+        guard let journal = try? journalStore.load() else { return false }
         let oldEntries = journal.entries.filter { $0.sessionID != sessionID }
-        guard !oldEntries.isEmpty else { return }
+        guard !oldEntries.isEmpty else { return false }
+        var needsRetry = false
 
         for entry in oldEntries {
+            // Older builds could journal a proxy before macOS published its
+            // EDID. Discovery no longer reports such services, so the entry
+            // can never be matched and would block every later quit.
+            if entry.identity.vendorID == 0, entry.identity.productID == 0 {
+                logger.notice("Discarding an unmatchable restore record for a display without EDID")
+                _ = try? journalStore.removeEntry(
+                    for: entry.identity,
+                    sessionID: entry.sessionID
+                )
+                continue
+            }
             let matchingDisplays = displays.values.filter {
                 $0.identity.matchesForPersistence(entry.identity)
             }
@@ -1143,20 +1162,32 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                     displayErrors[key] = nil
                     message = "Recovered \(display.name)'s brightness after an interrupted session."
                 } else {
-                    blockedDisplays.insert(key)
-                    displayErrors[key] = "A previous restore is pending, but the monitor was changed afterward. Sync is paused for it to protect that newer setting."
+                    // The monitor was adjusted after the interrupted session,
+                    // so the old original is no longer what the user expects
+                    // back. The current value becomes this session's baseline.
+                    logger.notice("Discarding an interrupted-session restore for \(display.name, privacy: .public): the monitor was changed afterward")
+                    _ = try journalStore.removeEntry(
+                        for: entry.identity,
+                        sessionID: entry.sessionID
+                    )
+                    rawValues[key] = current
+                    blockedDisplays.remove(key)
+                    displayErrors[key] = nil
                 }
             } catch {
                 blockedDisplays.insert(key)
-                displayErrors[key] = "Pending restore: \(error.localizedDescription)"
+                displayErrors[key] = "Pending restore: \(error.localizedDescription) Retrying automatically."
+                needsRetry = true
             }
         }
         updateActivityUnlocked()
+        return needsRetry
     }
 
     private func applySourceNitsUnlocked(
         _ nits: Double,
-        displayIDs: Set<String>? = nil
+        displayIDs: Set<String>? = nil,
+        isRetryPass: Bool = false
     ) {
         guard nits.isFinite, nits >= 0, phase == .syncing else { return }
         sourceNits = nits
@@ -1171,10 +1202,11 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             }
             estimatedNits[display.id] = target.estimatedNits
             clamps[display.id] = target.clamp
-            if writeRetryStates[display.id]?.rawValue != target.rawValue {
+            if writeRetryStates[display.id] != target.rawValue {
                 writeRetryStates[display.id] = nil
             }
-            if writeRetryStates[display.id] != nil,
+            if !isRetryPass,
+               writeRetryStates[display.id] != nil,
                displayRetrySchedule.hasPendingRetry(
                    at: ProcessInfo.processInfo.systemUptime
                ) {
@@ -1259,16 +1291,13 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         targetRawValue: UInt16,
         didReapply: Bool
     ) {
+        // Every caller runs on the serial coordinator queue, so cancelling a
+        // superseded work item before it starts is sufficient.
         cancelLiveVerificationUnlocked(displayID: displayID)
-        liveVerificationSequence &+= 1
-        let token = liveVerificationSequence
-        liveVerificationTokens[displayID] = token
 
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self,
-                  self.liveVerificationTokens[displayID] == token else { return }
+            guard let self else { return }
             self.liveVerificationWorkItems[displayID] = nil
-            self.liveVerificationTokens[displayID] = nil
             self.verifyLatestLiveWriteUnlocked(
                 displayID: displayID,
                 targetRawValue: targetRawValue,
@@ -1366,7 +1395,6 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
 
     private func cancelLiveVerificationUnlocked(displayID: String) {
         liveVerificationWorkItems.removeValue(forKey: displayID)?.cancel()
-        liveVerificationTokens[displayID] = nil
     }
 
     private func cancelAllLiveVerificationsUnlocked() {
@@ -1374,7 +1402,6 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             workItem.cancel()
         }
         liveVerificationWorkItems.removeAll()
-        liveVerificationTokens.removeAll()
     }
 
     /// A final restore must not race firmware that is still applying the last
@@ -1410,11 +1437,7 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         displayID: String,
         targetRawValue: UInt16
     ) {
-        let previousAttempts = writeRetryStates[displayID].flatMap {
-            $0.rawValue == targetRawValue ? $0.attempts : nil
-        } ?? 0
-        let attempts = previousAttempts == Int.max ? Int.max : previousAttempts + 1
-        writeRetryStates[displayID] = (targetRawValue, attempts)
+        writeRetryStates[displayID] = targetRawValue
         _ = scheduleDisplayRetryUnlocked()
     }
 
@@ -1517,9 +1540,15 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         return failures
     }
 
+    /// Records from earlier sessions for monitors that are not connected are
+    /// expected to wait for reconnection and are not quit failures.
     private func pendingRestoreNamesUnlocked() -> [String] {
         do {
-            return try journalStore.load().entries.map {
+            return try journalStore.load().entries.filter { entry in
+                entry.sessionID == sessionID || displays.values.contains {
+                    $0.identity.matchesForPersistence(entry.identity)
+                }
+            }.map {
                 profileNameUnlocked(for: $0.identity)
             }
         } catch {
@@ -1527,11 +1556,10 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
         }
     }
 
-    @discardableResult
     private func restoreEntryUnlocked(
         _ entry: RestoreJournalEntry,
         display: DDCDisplay
-    ) throws -> Bool {
+    ) throws {
         try ddc.writeBrightness(
             display,
             value: entry.originalRawValue,
@@ -1542,7 +1570,6 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
             for: entry.identity,
             sessionID: entry.sessionID
         )
-        return true
     }
 
     private func profileUnlocked(for display: DDCDisplay) -> DisplayProfile? {
@@ -1619,10 +1646,6 @@ final class DisplaySyncCoordinator: @unchecked Sendable {
                         : "Sync is paused. Open the monitor entry for last reported error."
                 case .syncing where statuses.contains(where: { $0.isBlocked }):
                     return "Some displays are paused while resolving writes. Open each monitor for details."
-                case .quiescing, .starting, .stopped:
-                    return nil
-                case .calibrating:
-                    return nil
                 default:
                     return nil
                 }

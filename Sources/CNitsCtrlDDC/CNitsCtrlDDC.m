@@ -65,7 +65,6 @@ static const int64_t CNDDCEDIDCopyTimeoutNanoseconds = 2 * NSEC_PER_SEC;
 @property(nonatomic, readwrite) uint64_t registryEntryID;
 @property(nonatomic, readwrite, copy) NSString *registryPath;
 @property(nonatomic, readwrite) uint32_t chipAddress;
-@property(nonatomic, readwrite) BOOL edidIsValid;
 
 - (instancetype)initWithAVService:(IOAVServiceRef)avService
                           edidData:(NSData *)edidData
@@ -236,33 +235,16 @@ static uint32_t CNDDCChipAddressForService(io_service_t service) {
     return CNDDCDisplayPortChipAddress;
 }
 
-static BOOL CNDDCValidateEDID(NSData *data) {
-    if (data.length < 128 || data.length % 128 != 0) {
+/// Identity, profiles, and restore records all derive from the base EDID
+/// block. Extension-block checksums are deliberately not required because some
+/// monitors publish broken extensions while their base block is usable.
+static BOOL CNDDCHasBaseEDID(NSData *data) {
+    if (data.length < 128) {
         return NO;
     }
-
-    const uint8_t *bytes = data.bytes;
     static const uint8_t header[] = {0x00, 0xff, 0xff, 0xff,
                                      0xff, 0xff, 0xff, 0x00};
-    if (memcmp(bytes, header, sizeof(header)) != 0) {
-        return NO;
-    }
-
-    NSUInteger requiredBlocks = (NSUInteger)bytes[126] + 1;
-    if (data.length < requiredBlocks * 128) {
-        return NO;
-    }
-
-    for (NSUInteger block = 0; block < requiredBlocks; block++) {
-        uint8_t checksum = 0;
-        for (NSUInteger index = 0; index < 128; index++) {
-            checksum = (uint8_t)(checksum + bytes[block * 128 + index]);
-        }
-        if (checksum != 0) {
-            return NO;
-        }
-    }
-    return YES;
+    return memcmp(data.bytes, header, sizeof(header)) == 0;
 }
 
 static NSString *CNDDCManufacturerID(uint16_t code) {
@@ -341,8 +323,6 @@ static NSString *CNDDCDescriptorText(const uint8_t *baseBlock, uint8_t tag) {
         _productName = [CNDDCDescriptorText(bytes, 0xfc) copy];
         _alphanumericSerialNumber = [CNDDCDescriptorText(bytes, 0xff) copy];
     }
-
-    _edidIsValid = CNDDCValidateEDID(edidData);
     return self;
 }
 
@@ -414,19 +394,21 @@ NSArray<CNDDCDisplay *> *CNDDCDiscoverExternalDisplays(NSError **error) {
                 continue;
             }
 
-            NSData *edidData = [NSData data];
+            // A proxy can exist before macOS publishes its EDID during a
+            // hot-plug. Without EDID it has no stable identity, and treating
+            // it as a display would journal a record that can never be
+            // matched once the real EDID appears. Skip it; an all-skipped
+            // discovery is reported below so the caller retries.
+            NSData *edidData = nil;
             if (IOAVServiceCopyEDID != NULL) {
                 BOOL edidTimedOut = NO;
-                NSData *copiedEDID = CNDDCCopyEDIDWithTimeout(
+                edidData = CNDDCCopyEDIDWithTimeout(
                     avService, entryID, &edidTimedOut);
-                if (edidTimedOut) {
-                    CFRelease(avService);
-                    IOObjectRelease(service);
-                    continue;
-                }
-                if (copiedEDID != nil) {
-                    edidData = copiedEDID;
-                }
+            }
+            if (!CNDDCHasBaseEDID(edidData)) {
+                CFRelease(avService);
+                IOObjectRelease(service);
+                continue;
             }
 
             io_string_t pathBuffer = {0};

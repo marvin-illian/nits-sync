@@ -63,11 +63,4 @@ public struct SyncPolicy: Sendable {
             clamp: clamp
         )
     }
-
-    public func targets(
-        for sourceNits: Double,
-        profiles: [DisplayProfile]
-    ) -> [DisplaySyncTarget] {
-        profiles.compactMap { target(for: sourceNits, profile: $0) }
-    }
 }

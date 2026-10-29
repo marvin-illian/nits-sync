@@ -145,8 +145,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.poweringOff = true
-            self?.coordinator.pauseForSystemEvent(.powerOff)
+            guard let self else { return }
+            self.poweringOff = true
+            self.coordinator.pauseForSystemEvent(.powerOff)
+            // macOS posts nothing when another app cancels logout or shutdown
+            // before this app is asked to quit. Still running after a minute
+            // means it was cancelled, so resume instead of staying paused.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                guard let self, self.poweringOff, !self.terminationInProgress else { return }
+                self.poweringOff = false
+                self.coordinator.resumeAfterSystemEvent(.powerOff)
+            }
         })
     }
 

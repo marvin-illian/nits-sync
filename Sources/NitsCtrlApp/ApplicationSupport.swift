@@ -29,10 +29,6 @@ enum ApplicationSupport {
         directoryURL.appendingPathComponent("display-profiles.json")
     }
 
-    static var restoreJournalURL: URL {
-        directoryURL.appendingPathComponent("restore-journal.json")
-    }
-
     static var existingProfilesURL: URL {
         existingFileURL(for: "display-profiles.json")
     }
@@ -67,20 +63,21 @@ final class DisplayProfileRepository {
 
     init(fileURL: URL = ApplicationSupport.profilesURL) {
         self.fileURL = fileURL
-        if let data = try? Data(contentsOf: fileURL),
-           let decoded = try? Self.decoder.decode(DisplayProfileStore.self, from: data) {
+        store = DisplayProfileStore()
+        guard let data = try? Data(contentsOf: fileURL) else { return }
+        if let decoded = try? Self.decoder.decode(DisplayProfileStore.self, from: data) {
             store = decoded
         } else {
-            store = DisplayProfileStore()
+            // Keep an unreadable file (e.g. from a newer build) instead of
+            // letting the first profile update overwrite every calibration.
+            let backupURL = fileURL.appendingPathExtension("unreadable")
+            try? FileManager.default.removeItem(at: backupURL)
+            try? FileManager.default.moveItem(at: fileURL, to: backupURL)
         }
     }
 
     func profile(for identity: ExternalDisplayIdentity) -> DisplayProfile? {
         store.profile(for: identity)
-    }
-
-    func allProfiles() -> [DisplayProfile] {
-        store.profiles
     }
 
     func upsert(_ profile: DisplayProfile) throws {

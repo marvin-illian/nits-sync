@@ -46,7 +46,6 @@ public final class BuiltInNitsReader: @unchecked Sendable {
     private let pollingQueue: DispatchQueue
     private let callbackQueue: DispatchQueue
     private let registryDisplayName: String?
-    private let registryCapNits: Double?
 
     private let stateLock = NSLock()
     private var timer: DispatchSourceTimer?
@@ -68,7 +67,6 @@ public final class BuiltInNitsReader: @unchecked Sendable {
         self.callbackQueue = callbackQueue
         let registrySnapshot = Self.readSnapshot()
         registryDisplayName = registrySnapshot.displayName
-        registryCapNits = registrySnapshot.capNits
         pollingQueue = DispatchQueue(
             label: "app.nits-sync.builtin-nits-reader",
             qos: .utility
@@ -96,14 +94,6 @@ public final class BuiltInNitsReader: @unchecked Sendable {
     /// generic label is returned after the built-in panel is detected.
     public var builtInDisplayName: String? {
         registryDisplayName
-    }
-
-    /// The panel's reported hardware ceiling, if AppleARMBacklight publishes
-    /// it. XDR displays can report their HDR peak here rather than the normal
-    /// SDR ceiling, so callers should present this as capability metadata and
-    /// must not use it to convert a brightness percentage to nits.
-    public var builtInDisplayCapNits: Double? {
-        registryCapNits
     }
 
     /// Starts observing native brightness changes and samples immediately.
@@ -420,7 +410,6 @@ private extension BuiltInNitsReader {
     struct RegistrySnapshot {
         var framebufferNits: Double?
         var backlightNits: Double?
-        var capNits: Double?
         var displayName: String?
         var foundBuiltInDisplay = false
 
@@ -465,11 +454,6 @@ private extension BuiltInNitsReader {
                 if let value = number(from: milliNits["value"]) {
                     snapshot.backlightNits = validatedPositiveNits(
                         value.doubleValue / 1_000.0
-                    )
-                }
-                if let maximum = number(from: milliNits["max"]) {
-                    snapshot.capNits = validatedPositiveNits(
-                        maximum.doubleValue / 1_000.0
                     )
                 }
             }
